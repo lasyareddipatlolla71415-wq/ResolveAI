@@ -1,0 +1,23 @@
+{
+  "name": "resolveai",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Outcome-driven adaptive problem resolution and intelligent ticketing system.",
+  "workspaces": [
+    "client",
+    "server",
+    "shared"
+  ],
+  "scripts": {
+    "dev": "concurrently \"npm run dev -w server\" \"npm run dev -w client\"",
+    "build": "npm run build -w shared && npm run build -w server && npm run build -w client",
+    "test": "npm run test -w server",
+    "lint": "npm run lint -ws",
+    "format": "prettier --write ."
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.0",
+    "prettier": "^3.3.3",
+    "typescript": "^5.6.3"
+  }
+}
