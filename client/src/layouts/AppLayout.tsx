@@ -15,6 +15,7 @@ import {
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { useAuth } from "../contexts/AuthContext";
 import { cn } from "../utils/cn";
+import { ThemeToggle } from "../components/ThemeToggle";
 
 export function AppLayout() {
   const { user, isAdmin, isStaff, logout } = useAuth();
@@ -66,8 +67,8 @@ export function AppLayout() {
     : "RA";
 
   return (
-    <div className="min-h-screen bg-slate-100 text-slate-950 lg:grid lg:grid-cols-[280px_1fr]">
-      <aside className="border-b border-slate-200 bg-slate-950 text-white lg:min-h-screen lg:border-b-0 lg:border-r flex flex-col justify-between">
+    <div className="min-h-screen bg-slate-100 dark:bg-slate-950 text-slate-950 dark:text-slate-100 lg:grid lg:grid-cols-[280px_1fr]">
+      <aside className="border-b border-slate-200 dark:border-slate-800 bg-slate-950 text-white lg:min-h-screen lg:border-b-0 lg:border-r lg:border-slate-800/80 flex flex-col justify-between">
         <div>
           {/* Brand Header */}
           <div className="flex items-center justify-between px-5 py-5 border-b border-white/5">
@@ -97,6 +98,7 @@ export function AppLayout() {
                 </div>
               </div>
             </div>
+            <ThemeToggle />
           </div>
 
           {/* Navigation Links */}

@@ -8,9 +8,11 @@ import {
   Phone,
   Save,
   Shield,
+  Sun,
   User as UserIcon
 } from "lucide-react";
 import { PageHeader } from "../components/PageHeader";
+import { ThemeSegmentedToggle } from "../components/ThemeToggle";
 import { useAuth } from "../contexts/AuthContext";
 import { updateProfileApi } from "../services/api";
 import { cn } from "../utils/cn";
@@ -171,6 +173,27 @@ export function Settings() {
               </button>
             </div>
           </form>
+        </section>
+
+        {/* Appearance & Theme Card */}
+        <section className="rounded-2xl border border-slate-200/80 bg-white shadow-xs">
+          <div className="border-b border-slate-100 px-6 py-4">
+            <div className="flex items-center gap-2">
+              <Sun className="h-4 w-4 text-amber-500" />
+              <h2 className="text-sm font-bold text-slate-900">Appearance & Theme</h2>
+            </div>
+          </div>
+          <div className="p-6 space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 rounded-xl border border-slate-200/80 bg-slate-50/50 p-4">
+              <div>
+                <p className="text-xs font-bold text-slate-900">Color Theme Preference</p>
+                <p className="text-[11px] text-slate-500">
+                  Switch between sleek Dark Mode, crisp Light Mode, or follow your Operating System.
+                </p>
+              </div>
+              <ThemeSegmentedToggle />
+            </div>
+          </div>
         </section>
 
         {/* Security Card */}

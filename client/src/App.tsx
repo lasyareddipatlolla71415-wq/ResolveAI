@@ -1,5 +1,6 @@
 import { Navigate, Route, Routes } from "react-router-dom";
 import { AuthProvider, useAuth } from "./contexts/AuthContext";
+import { ThemeProvider } from "./contexts/ThemeContext";
 import { AppLayout } from "./layouts/AppLayout";
 import { AdminDashboard } from "./pages/AdminDashboard";
 import { AiSupport } from "./pages/AiSupport";
@@ -58,11 +59,13 @@ function ProtectedRoutes() {
 
 export function App() {
   return (
-    <AuthProvider>
-      <Routes>
-        <Route path="/login" element={<LoginPage />} />
-        <Route path="/*" element={<ProtectedRoutes />} />
-      </Routes>
-    </AuthProvider>
+    <ThemeProvider>
+      <AuthProvider>
+        <Routes>
+          <Route path="/login" element={<LoginPage />} />
+          <Route path="/*" element={<ProtectedRoutes />} />
+        </Routes>
+      </AuthProvider>
+    </ThemeProvider>
   );
 }
