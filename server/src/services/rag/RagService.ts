@@ -10,6 +10,7 @@ export interface RagChunk {
   chunkId: string;
   documentId: string;
   title: string;
+  category?: string;
   content: string;
   relevance: number;
   metadata: Record<string, unknown>;
@@ -110,6 +111,7 @@ class InMemoryVectorRagService implements RagService {
         chunkId: chunk.chunkId,
         documentId: chunk.documentId,
         title: chunk.title,
+        category: chunk.category,
         content: chunk.content,
         relevance: cosineSimilarity(queryEmbedding, chunk.embedding),
         metadata: chunk.metadata
@@ -196,6 +198,7 @@ class MongoVectorRagService implements RagService {
           chunkId: 1,
           documentId: 1,
           title: 1,
+          category: 1,
           content: 1,
           metadata: 1,
           relevance: { $meta: "vectorSearchScore" }
@@ -203,7 +206,57 @@ class MongoVectorRagService implements RagService {
       }
     ];
 
-    return KnowledgeChunkModel.aggregate<RagChunk>(pipeline);
+    try {
+      const results = await KnowledgeChunkModel.aggregate<RagChunk>(pipeline);
+      if (results && results.length > 0) {
+        return results;
+      }
+    } catch {
+      // $vectorSearch index might not be configured on MongoDB Atlas yet, fall through to text match
+    }
+
+    const tokens = tokenize(query);
+    const queryRegex = tokens.length > 0 ? new RegExp(tokens.join("|"), "i") : undefined;
+    const queryFilter = {
+      ...(filter || {}),
+      ...(queryRegex ? { $or: [{ title: queryRegex }, { content: queryRegex }] } : {})
+    };
+
+    const chunks = await KnowledgeChunkModel.find(queryFilter).limit(limit).lean();
+    const queryEmbedding = embedText(query);
+
+    return chunks
+      .map((chunk) => ({
+        chunkId: chunk.chunkId,
+        documentId: chunk.documentId,
+        title: chunk.title,
+        category: chunk.category,
+        content: chunk.content,
+        relevance: cosineSimilarity(queryEmbedding, chunk.embedding),
+        metadata: (chunk.metadata as Record<string, unknown>) ?? {}
+      }))
+      .sort((left, right) => right.relevance - left.relevance);
+  }
+}
+
+export async function seedMongoKnowledge() {
+  if (!isDatabaseConnected()) return;
+  try {
+    const count = await KnowledgeChunkModel.countDocuments();
+    if (count === 0) {
+      const rag = new MongoVectorRagService();
+      for (const doc of defaultKnowledgeDocuments) {
+        await rag.indexDocument({
+          title: doc.title,
+          content: doc.content,
+          category: doc.category,
+          metadata: { actionId: "actionId" in doc ? (doc as any).actionId : undefined, id: doc.id }
+        });
+      }
+      console.log(`Seeded ${defaultKnowledgeDocuments.length} IT knowledge base documents into MongoDB.`);
+    }
+  } catch (err) {
+    console.warn("Could not seed knowledge to MongoDB:", (err as Error).message);
   }
 }
 
@@ -319,7 +372,123 @@ function isDatabaseConnected() {
   return mongoose.connection.readyState === 1;
 }
 
-const defaultKnowledgeDocuments = [
+export const defaultKnowledgeDocuments = [
+  {
+    id: "kb-wifi-not-connecting",
+    title: "Wi-Fi not connecting",
+    category: "network",
+    actionId: "wifi_not_connecting",
+    content: [
+      "PROBLEM: Wi-Fi is not working or the device cannot connect to a wireless network (e.g. 'Can't connect to this network').",
+      "TROUBLESHOOTING STEPS:",
+      "1. Confirm Wi-Fi is turned on (check the Wi-Fi toggle / airplane mode is off). Expected: the Wi-Fi list shows available networks.",
+      "2. Forget the network and reconnect, re-entering the password. Expected: the device reconnects successfully.",
+      "3. Restart the Wi-Fi adapter or toggle airplane mode on then off. Expected: the adapter re-scans and connects.",
+      "4. Restart the device. Expected: a clean network stack reconnects automatically.",
+      "5. Move closer to the router / access point to rule out signal strength. Expected: stronger signal and a stable connection.",
+      "EXPECTED RESULT: The device connects to the Wi-Fi network and can browse the internet.",
+      "ESCALATION CONDITIONS: All steps attempted and still no connection, OR multiple users/devices cannot connect, OR the access point appears down."
+    ].join("\n")
+  },
+  {
+    id: "kb-internet-connection",
+    title: "Connected to Wi-Fi but no internet",
+    category: "network",
+    actionId: "wifi_no_internet",
+    content: [
+      "PROBLEM: The device is connected to the network but web pages do not load (no internet / limited connectivity).",
+      "TROUBLESHOOTING STEPS:",
+      "1. Check whether other devices on the same network have internet. Expected: identifies if the issue is local or network-wide.",
+      "2. Power-cycle the modem/router: unplug for 30 seconds, plug back in, wait 2 minutes. Expected: internet is restored.",
+      "3. Renew the IP address (disable/enable the adapter). Expected: a valid IP and gateway are obtained.",
+      "4. Try a known site by IP to rule out DNS, then flush DNS. Expected: pages resolve normally.",
+      "EXPECTED RESULT: Web pages load and internet access is restored.",
+      "ESCALATION CONDITIONS: No device on the network has internet (possible ISP/office outage), OR the entire office is affected."
+    ].join("\n")
+  },
+  {
+    id: "kb-vpn-will-not-connect",
+    title: "VPN will not connect",
+    category: "vpn",
+    actionId: "vpn_wont_connect",
+    content: [
+      "PROBLEM: The corporate VPN fails to connect or drops repeatedly.",
+      "TROUBLESHOOTING STEPS:",
+      "1. Confirm the device has working internet without the VPN. Expected: general browsing works.",
+      "2. Sign out and back into the VPN client, re-entering credentials/MFA. Expected: authentication succeeds.",
+      "3. Switch to a different VPN server/region if available. Expected: connection establishes on an alternate gateway.",
+      "4. Restart the VPN client and the device. Expected: a clean client session connects.",
+      "EXPECTED RESULT: The VPN connects and internal resources are reachable.",
+      "ESCALATION CONDITIONS: Correct credentials still fail, the VPN gateway appears down, or many users cannot connect."
+    ].join("\n")
+  },
+  {
+    id: "kb-printer-not-printing",
+    title: "Printer not printing",
+    category: "hardware",
+    actionId: "printer_not_printing",
+    content: [
+      "PROBLEM: Documents do not print, or the printer shows offline/error.",
+      "TROUBLESHOOTING STEPS:",
+      "1. Check the printer is powered on, has paper and toner/ink, and no error lights. Expected: printer shows ready.",
+      "2. Confirm the printer is set as default and shows 'Online' (not paused). Expected: status is Online.",
+      "3. Clear the print queue and resend the job. Expected: the stuck job clears and the new job prints.",
+      "4. Restart the Print Spooler service (or restart the computer). Expected: printing resumes.",
+      "5. Reinstall/reconnect the printer driver. Expected: the printer is detected and prints a test page.",
+      "EXPECTED RESULT: A test page or document prints successfully.",
+      "ESCALATION CONDITIONS: Hardware fault (paper jam that cannot be cleared, hardware error code), or a shared office printer is down for many users."
+    ].join("\n")
+  },
+  {
+    id: "kb-outlook-email",
+    title: "Outlook not sending or receiving",
+    category: "software",
+    actionId: "outlook_not_working",
+    content: [
+      "PROBLEM: Outlook will not send/receive email or is stuck 'Trying to connect'.",
+      "TROUBLESHOOTING STEPS:",
+      "1. Check internet connectivity. Expected: browsing works.",
+      "2. Confirm Outlook is Online (Send/Receive tab, not Work Offline). Expected: status is Connected.",
+      "3. Send/Receive All Folders manually. Expected: mail syncs.",
+      "4. Restart Outlook, then restart the computer. Expected: the profile reconnects.",
+      "5. Verify credentials / re-authenticate the account if prompted. Expected: mailbox authenticates.",
+      "EXPECTED RESULT: Email sends and receives normally.",
+      "ESCALATION CONDITIONS: Mailbox authentication keeps failing, mailbox is full/locked, or the mail server is unreachable for many users."
+    ].join("\n")
+  },
+  {
+    id: "kb-password-account-access",
+    title: "Cannot log in / password issues",
+    category: "account",
+    actionId: "password_account_issues",
+    content: [
+      "PROBLEM: The user cannot sign in, or the account is locked.",
+      "TROUBLESHOOTING STEPS:",
+      "1. Confirm the username/email is correct and Caps Lock is off. Expected: correct credentials entered.",
+      "2. Verify the correct domain/portal is being used. Expected: sign-in page matches the account.",
+      "3. Use the self-service password reset if available. Expected: password is reset and login succeeds.",
+      "4. Complete any MFA prompt / re-register the MFA device if needed. Expected: MFA verification passes.",
+      "EXPECTED RESULT: The user successfully signs in.",
+      "ESCALATION CONDITIONS: The account is locked and self-service reset is unavailable, or MFA cannot be recovered — a technician must reset/unlock the account."
+    ].join("\n")
+  },
+  {
+    id: "kb-computer-problems",
+    title: "Computer slow, frozen, or not starting",
+    category: "system",
+    actionId: "computer_slow_frozen",
+    content: [
+      "PROBLEM: The computer is very slow, frozen, or will not start properly.",
+      "TROUBLESHOOTING STEPS:",
+      "1. Save work and restart the computer. Expected: performance improves after a reboot.",
+      "2. Close heavy or unresponsive apps (Task Manager). Expected: resources free up.",
+      "3. Check for and install pending OS updates, then reboot. Expected: stability improves.",
+      "4. Ensure enough free disk space (delete temp files if very low). Expected: the system runs normally.",
+      "5. If it will not power on, check power cable/battery and hold the power button 10s then restart. Expected: the device boots.",
+      "EXPECTED RESULT: The computer runs normally and is responsive.",
+      "ESCALATION CONDITIONS: The device will not boot after these steps, shows hardware error/blue-screen loops, or the issue is business-critical."
+    ].join("\n")
+  },
   {
     id: "kb-wifi-authentication",
     title: "Wi-Fi Authentication Runbook",
