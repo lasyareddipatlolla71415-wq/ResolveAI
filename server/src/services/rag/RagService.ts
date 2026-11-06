@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import mongoose from "mongoose";
 import { KnowledgeChunkModel } from "../../models/KnowledgeChunk.js";
+import { resolveEmbeddingProvider } from "./EmbeddingProvider.js";
 
 const embeddingDimensions = 384;
 const defaultVectorIndexName = "knowledge_embedding_index";
@@ -55,21 +56,9 @@ export function createRagService(): RagService {
   return isDatabaseConnected() ? new MongoVectorRagService() : new InMemoryVectorRagService();
 }
 
-export function embedText(text: string) {
-  const vector = Array.from({ length: embeddingDimensions }, () => 0);
-  const tokens = tokenize(text);
-
-  for (const token of tokens) {
-    const digest = createHash("sha256").update(token).digest();
-
-    for (let index = 0; index < 4; index += 1) {
-      const position = digest.readUInt16BE(index * 2) % embeddingDimensions;
-      const sign = digest[index + 8] % 2 === 0 ? 1 : -1;
-      vector[position] += sign * (1 + Math.log(token.length));
-    }
-  }
-
-  return normalizeVector(vector);
+export async function embedText(text: string) {
+  const provider = resolveEmbeddingProvider();
+  return provider.embed(text);
 }
 
 class InMemoryVectorRagService implements RagService {
@@ -80,20 +69,26 @@ class InMemoryVectorRagService implements RagService {
   async indexDocument(input: IndexKnowledgeDocumentInput): Promise<KnowledgeDocumentSummary> {
     const documentId = randomUUID();
     const category = normalizeCategory(input.category);
-    const chunks = chunkText(input.content).map((content, index) => ({
-      chunkId: `${documentId}:${index}`,
-      documentId,
-      title: input.title,
-      category,
-      content,
-      embedding: embedText(`${input.title}\n${content}`),
-      metadata: { ...input.metadata, sourceType: "development", chunkIndex: index },
-      updatedAt: new Date().toISOString()
-    }));
+    const chunksToInsert = [];
+    const chunksRaw = chunkText(input.content);
+    for (let index = 0; index < chunksRaw.length; index++) {
+      const content = chunksRaw[index];
+      const embedding = await embedText(`${input.title}\n${content}`);
+      chunksToInsert.push({
+        chunkId: `${documentId}:${index}`,
+        documentId,
+        title: input.title,
+        category,
+        content,
+        embedding,
+        metadata: { ...input.metadata, sourceType: "development", chunkIndex: index },
+        updatedAt: new Date().toISOString()
+      });
+    }
 
-    developmentChunks.push(...chunks);
+    developmentChunks.push(...chunksToInsert);
 
-    return summarizeChunks(chunks, "memory")[0];
+    return summarizeChunks(chunksToInsert, "memory")[0];
   }
 
   async listDocuments(): Promise<KnowledgeDocumentSummary[]> {
@@ -101,7 +96,7 @@ class InMemoryVectorRagService implements RagService {
   }
 
   async retrieve(query: string, options: RetrieveKnowledgeOptions = {}): Promise<RagChunk[]> {
-    const queryEmbedding = embedText(query);
+    const queryEmbedding = await embedText(query);
     const category = options.category ? normalizeCategory(options.category) : undefined;
     const limit = clampLimit(options.limit);
 
@@ -125,23 +120,29 @@ class MongoVectorRagService implements RagService {
   async indexDocument(input: IndexKnowledgeDocumentInput): Promise<KnowledgeDocumentSummary> {
     const documentId = new mongoose.Types.ObjectId().toString();
     const category = normalizeCategory(input.category);
-    const chunks = chunkText(input.content).map((content, index) => ({
-      documentId,
-      chunkId: `${documentId}:${index}`,
-      title: input.title,
-      category,
-      content,
-      embedding: embedText(`${input.title}\n${content}`),
-      metadata: { ...input.metadata, chunkIndex: index }
-    }));
+    const chunksToInsert = [];
+    const chunksRaw = chunkText(input.content);
+    for (let index = 0; index < chunksRaw.length; index++) {
+      const content = chunksRaw[index];
+      const embedding = await embedText(`${input.title}\n${content}`);
+      chunksToInsert.push({
+        documentId,
+        chunkId: `${documentId}:${index}`,
+        title: input.title,
+        category,
+        content,
+        embedding,
+        metadata: { ...input.metadata, chunkIndex: index }
+      });
+    }
 
-    await KnowledgeChunkModel.insertMany(chunks);
+    await KnowledgeChunkModel.insertMany(chunksToInsert);
 
     return {
       documentId,
       title: input.title,
       category,
-      chunkCount: chunks.length,
+      chunkCount: chunksToInsert.length,
       storage: "mongodb-vector",
       updatedAt: new Date().toISOString()
     };
@@ -180,62 +181,70 @@ class MongoVectorRagService implements RagService {
   async retrieve(query: string, options: RetrieveKnowledgeOptions = {}): Promise<RagChunk[]> {
     const category = options.category ? normalizeCategory(options.category) : undefined;
     const limit = clampLimit(options.limit);
-    const filter = category ? { category } : undefined;
-    const pipeline = [
-      {
-        $vectorSearch: {
-          index: process.env.MONGODB_VECTOR_INDEX ?? defaultVectorIndexName,
-          path: "embedding",
-          queryVector: embedText(query),
-          numCandidates: Math.max(limit * 20, 100),
-          limit,
-          ...(filter ? { filter } : {})
-        }
-      },
-      {
-        $project: {
-          _id: 0,
-          chunkId: 1,
-          documentId: 1,
-          title: 1,
-          category: 1,
-          content: 1,
-          metadata: 1,
-          relevance: { $meta: "vectorSearchScore" }
-        }
-      }
-    ];
+    const categoryFilter = category ? { category } : {};
+    const approvalFilter = { "metadata.approvalStatus": { $ne: "REJECTED" } };
 
+    // 1. Try MongoDB Atlas Vector Search native aggregation pipeline
     try {
+      const queryVector = await embedText(query);
+      const pipeline: any[] = [
+        {
+          $vectorSearch: {
+            index: process.env.MONGODB_VECTOR_INDEX ?? defaultVectorIndexName,
+            path: "embedding",
+            queryVector,
+            numCandidates: Math.max(limit * 20, 100),
+            limit,
+            ...(category ? { filter: { category } } : {})
+          }
+        },
+        {
+          $project: {
+            _id: 0,
+            chunkId: 1,
+            documentId: 1,
+            title: 1,
+            category: 1,
+            content: 1,
+            metadata: 1,
+            relevance: { $meta: "vectorSearchScore" }
+          }
+        }
+      ];
+
       const results = await KnowledgeChunkModel.aggregate<RagChunk>(pipeline);
       if (results && results.length > 0) {
-        return results;
+        return results.filter((r) => r.metadata?.approvalStatus !== "REJECTED");
       }
     } catch {
-      // $vectorSearch index might not be configured on MongoDB Atlas yet, fall through to text match
+      // $vectorSearch index might not be configured on MongoDB Atlas yet, fall through to vector embedding search
     }
 
-    const tokens = tokenize(query);
-    const queryRegex = tokens.length > 0 ? new RegExp(tokens.join("|"), "i") : undefined;
-    const queryFilter = {
-      ...(filter || {}),
-      ...(queryRegex ? { $or: [{ title: queryRegex }, { content: queryRegex }] } : {})
-    };
+    // 2. Semantic Vector Embedding Search over MongoDB Atlas Chunks
+    const queryEmbedding = await embedText(query);
+    const candidateChunks = await KnowledgeChunkModel.find({
+      ...categoryFilter,
+      ...approvalFilter
+    })
+      .limit(100)
+      .lean();
 
-    const chunks = await KnowledgeChunkModel.find(queryFilter).limit(limit).lean();
-    const queryEmbedding = embedText(query);
+    if (candidateChunks.length > 0) {
+      return candidateChunks
+        .map((chunk) => ({
+          chunkId: chunk.chunkId,
+          documentId: chunk.documentId,
+          title: chunk.title,
+          category: chunk.category,
+          content: chunk.content,
+          relevance: cosineSimilarity(queryEmbedding, chunk.embedding),
+          metadata: (chunk.metadata as Record<string, unknown>) ?? {}
+        }))
+        .sort((left, right) => right.relevance - left.relevance)
+        .slice(0, limit);
+    }
 
-    return chunks
-      .map((chunk) => ({
-        chunkId: chunk.chunkId,
-        documentId: chunk.documentId,
-        title: chunk.title,
-        category: chunk.category,
-        content: chunk.content,
-        relevance: cosineSimilarity(queryEmbedding, chunk.embedding),
-        metadata: (chunk.metadata as Record<string, unknown>) ?? {}
-      }))
-      .sort((left, right) => right.relevance - left.relevance);
+    return [];
   }
 }
 
@@ -260,49 +269,42 @@ export async function seedMongoKnowledge() {
   }
 }
 
-function seedDevelopmentKnowledge() {
+async function seedDevelopmentKnowledge() {
   if (developmentChunks.length > 0) {
     return;
   }
 
   for (const document of defaultKnowledgeDocuments) {
     const documentId = document.id;
-    const chunks = chunkText(document.content).map((content, index) => ({
-      chunkId: `${documentId}:${index}`,
-      documentId,
-      title: document.title,
-      category: document.category,
-      content,
-      embedding: embedText(`${document.title}\n${content}`),
-      metadata: { sourceType: "seed", actionId: document.actionId, chunkIndex: index },
-      updatedAt: new Date(0).toISOString()
-    }));
-
-    developmentChunks.push(...chunks);
+    const chunksRaw = chunkText(document.content);
+    for (let index = 0; index < chunksRaw.length; index++) {
+      const content = chunksRaw[index];
+      const embedding = await embedText(`${document.title}\n${content}`);
+      developmentChunks.push({
+        chunkId: `${documentId}:${index}`,
+        documentId,
+        title: document.title,
+        category: document.category,
+        content,
+        embedding,
+        metadata: { sourceType: "seed", actionId: document.actionId, chunkIndex: index },
+        updatedAt: new Date(0).toISOString()
+      });
+    }
   }
 }
 
 function chunkText(text: string) {
-  const paragraphs = text
-    .replace(/\r\n/g, "\n")
-    .split(/\n{2,}/)
-    .map((paragraph) => paragraph.trim())
-    .filter(Boolean);
-
+  // Split by headings (e.g. PROBLEM:, TROUBLESHOOTING STEPS:, EXPECTED RESULT:, ESCALATION CONDITIONS:)
+  // or double newlines, but keeping ordered step lists together.
+  const sections = text.split(/(?=^[A-Z\s]+:$)/m).filter(Boolean);
   const chunks: string[] = [];
-  let current = "";
 
-  for (const paragraph of paragraphs.length > 0 ? paragraphs : [text.trim()]) {
-    if (`${current}\n\n${paragraph}`.trim().length > 900 && current) {
-      chunks.push(current);
-      current = paragraph;
-    } else {
-      current = `${current}\n\n${paragraph}`.trim();
+  for (const section of sections) {
+    const trimmed = section.trim();
+    if (trimmed.length > 0) {
+      chunks.push(trimmed);
     }
-  }
-
-  if (current) {
-    chunks.push(current);
   }
 
   return chunks.length > 0 ? chunks : [text.trim()];

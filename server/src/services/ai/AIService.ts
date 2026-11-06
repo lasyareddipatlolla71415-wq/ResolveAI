@@ -2,42 +2,41 @@ import type { ChatMessageRecord } from "@resolveai/shared";
 import type { AiMessage, AiProvider } from "./AiProvider.js";
 import { MockAiProvider } from "./MockAiProvider.js";
 import { OpenAiProvider } from "./OpenAiProvider.js";
-import { createRagService } from "../rag/RagService.js";
+import { createRagService, type RagChunk } from "../rag/RagService.js";
+import { chatStateSchema, type ChatState } from "./schema.js";
+import { ConversationalEngine } from "./ConversationalEngine.js";
 
-export const itSupportSystemPrompt = `You are an experienced, friendly IT support technician for the company helpdesk. You help non-technical users solve common IT problems step by step, and you escalate to a human technician only when appropriate.
+export const itSupportSystemPrompt = `You are ResolveAI's senior Tier-1 conversational technical support assistant.
+You speak naturally, empathetically, and conversationally like a helpful IT specialist.
 
-SOURCE OF TRUTH:
-- You MUST use the approved troubleshooting procedures from the knowledge base provided below BEFORE recommending any step.
-- NEVER invent troubleshooting steps that are not supported by the knowledge base. If the knowledge base has no relevant procedure, say so and offer to escalate to a technician.
+CORE BEHAVIOR & RULES:
+1. Converse naturally in fluent, friendly language. DO NOT sound like a rigid decision tree or ask yes/no questions repeatedly.
+2. Maintain Conversation Context: Understand previous messages. Understand pronouns ("it", "the other device", "since yesterday"). Never re-ask questions the user already answered.
+3. Follow-up Intelligence: Ask smart follow-up questions to narrow down the issue (e.g., "Can your phone or another device connected to the same Wi-Fi access the internet?").
+4. Grounded in Approved Knowledge: When approved knowledge base procedures are provided below, guide the user through their approved actions step-by-step. Do NOT invent arbitrary or unauthorized technical procedures.
+5. Adaptive Troubleshooting: If a user reports an action failed ("didn't work", "tried that already"), do not repeat it. Suggest the next logical approved action.
+6. Detect Resolution: If the user indicates the problem is resolved ("that worked", "it's working now", "fixed"), celebrate the outcome and confirm resolution without escalating.
+7. Escalation: If all troubleshooting fails, or the problem is a critical outage, or the user requests a human/technician, explain that you are creating an official IT ticket and escalate cleanly.
 
-SUPPORTED CATEGORIES:
-- Wi-Fi / Network
-- Internet connection
-- VPN
-- Printer
-- Outlook / Email
-- Password / Account access
-- General computer problems
-
-TROUBLESHOOTING PROCESS:
-1. Understand the problem and identify the category. If the category or device is unclear, ask a brief clarifying question.
-2. Give exactly ONE step at a time using this format:
-   Step N:
-   [one action]
-
-   Expected result:
-   [what should happen]
-
-   What happened after you tried this?
-3. Wait for the user result before giving the next step. Never dump multiple steps at once.
-4. If a step solved it: Confirm cheerfully that the issue has been resolved and no support ticket is needed.
-5. If a step did not solve it: Continue to the NEXT approved step. Do NOT escalate just because one step failed.
-6. When ALL relevant approved steps are exhausted and the issue is unresolved: Let the user know you are raising a support ticket so a technician can continue the investigation.
-
-ESCALATION RULES:
-- All relevant approved steps attempted and issue still unresolved, OR
-- The user explicitly asks for a technician / support ticket / says they do not want to troubleshoot (escalate IMMEDIATELY), OR
-- An urgent condition is described (office-wide outage, business-critical service down).`;
+OUTPUT FORMAT:
+You must respond strictly with a valid JSON object matching this schema:
+{
+  "status": "troubleshooting" | "solved" | "escalated",
+  "issue_category": "network" | "hardware" | "software" | "vpn" | "account" | "system" | "other",
+  "issue_type": "string",
+  "device": "string",
+  "operating_system": "string",
+  "current_step": number,
+  "completed_steps": ["string"],
+  "failed_steps": ["string"],
+  "error_message": "string",
+  "solved": boolean,
+  "escalate": boolean,
+  "reason_for_escalation": "string",
+  "source_id": "string",
+  "assistant_reply": "string (the natural, helpful response to display to the user)"
+}
+Never include markdown code blocks like \`\`\`json around the response. Just output the raw JSON object.`;
 
 export function resolveAiProvider(): AiProvider {
   if (process.env.NODE_ENV === "test" && !process.env.FORCE_LLM_TEST) {
@@ -59,32 +58,55 @@ export function resolveAiProvider(): AiProvider {
 }
 
 export class AIService {
+  private engine = new ConversationalEngine();
+
   constructor(private readonly provider: AiProvider = resolveAiProvider()) {}
 
-  async generateChatReply(messages: ChatMessageRecord[]) {
-    const lastUserMessage = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
+  async generateChatReply(messages: ChatMessageRecord[], state?: Record<string, any>) {
+    // 1. Analyze multi-turn conversation context
+    const analysis = this.engine.analyzeConversation(messages, state);
 
+    // 2. Synthesize semantic query & retrieve approved knowledge from MongoDB Atlas
+    let relevantChunks: RagChunk[] = [];
     let ragContext = "";
-    if (lastUserMessage) {
-      try {
-        const ragService = createRagService();
-        const relevantChunks = await ragService.retrieve(lastUserMessage, { limit: 3 });
-        if (relevantChunks.length > 0) {
-          const procedures = relevantChunks
-            .map(
-              (chunk, index) =>
-                `--- PROCEDURE ${index + 1}: ${chunk.title} (${chunk.category}) ---\n${chunk.content}`
-            )
-            .join("\n\n");
-          ragContext = `\n\nAPPROVED KNOWLEDGE BASE PROCEDURES (SOURCE OF TRUTH):\n${procedures}\n\nINSTRUCTION: Recommend steps from these procedures one at a time.`;
-        }
-      } catch (err) {
-        console.warn("[AIService] RAG retrieval error:", err);
+    try {
+      const ragService = createRagService();
+      relevantChunks = await ragService.retrieve(analysis.semanticSearchQuery, {
+        category: analysis.category !== "other" ? analysis.category : undefined,
+        limit: 3
+      });
+
+      if (relevantChunks.length === 0 && analysis.category !== "other") {
+        relevantChunks = await ragService.retrieve(analysis.semanticSearchQuery, { limit: 3 });
       }
+
+      if (relevantChunks.length > 0) {
+        const procedures = relevantChunks
+          .map(
+            (chunk, index) =>
+              `--- PROCEDURE ${index + 1}: ${chunk.title} (${chunk.category}) ---\n${chunk.content}`
+          )
+          .join("\n\n");
+        ragContext = `\n\nAPPROVED KNOWLEDGE BASE PROCEDURES (SOURCE OF TRUTH):\n${procedures}\n\nINSTRUCTION: Guide the user through these approved actions one step at a time.`;
+      }
+    } catch (err) {
+      console.warn("[AIService] RAG retrieval error:", err);
     }
 
-    const providerMessages: AiMessage[] = [
-      { role: "system", content: `${itSupportSystemPrompt}${ragContext}` },
+    // 3. If using MockAiProvider, generate conversational response directly using ConversationalEngine
+    if (this.provider instanceof MockAiProvider) {
+      const result = this.engine.generateConversationalTurn(analysis, messages, relevantChunks, state);
+      return {
+        content: result.replyText,
+        confidence: 0.95,
+        state: result.state
+      };
+    }
+
+    // 4. Otherwise, format prompt for real LLM provider (OpenAI / Ollama / etc.)
+    const stateContext = state ? `\n\nCURRENT CONVERSATION STATE:\n${JSON.stringify(state, null, 2)}` : "";
+    const baseMessages: AiMessage[] = [
+      { role: "system", content: `${itSupportSystemPrompt}${ragContext}${stateContext}` },
       ...messages.map((message) => ({
         role: message.role,
         content: message.content
@@ -92,19 +114,30 @@ export class AIService {
     ];
 
     try {
-      return await this.provider.generateResponse(providerMessages);
+      let rawResponse = await this.provider.generateResponse(baseMessages, state);
+      
+      let parsedResult: ChatState;
+      try {
+        const cleanContent = rawResponse.content.replace(/^```json\s*/, "").replace(/```$/, "").trim();
+        const parsed = JSON.parse(cleanContent);
+        parsedResult = chatStateSchema.parse(parsed);
+      } catch (err) {
+        console.warn("JSON parse/validation failed, falling back to conversational engine turn:", err);
+        const fallback = this.engine.generateConversationalTurn(analysis, messages, relevantChunks, state);
+        parsedResult = fallback.state;
+      }
+      
+      return {
+        content: parsedResult.assistant_reply,
+        confidence: rawResponse.confidence,
+        state: parsedResult
+      };
     } catch (error) {
       console.error("AI provider failed:", error);
-      const msg = error instanceof Error ? error.message : String(error);
-      const isQuotaError = msg.includes("credits remaining") || msg.includes("insufficient_quota") || msg.includes("credit_balance_exhausted");
-
       return {
-        content: isQuotaError
-          ? "I am having trouble reaching the AI service right now: Your OpenAI account has exhausted its available credits. Please check your quota or billing details at https://platform.openai.com/settings/organization/billing/."
-          : "I am having trouble reaching the AI service right now. Please retry in a moment.",
+        content: "I am having trouble reaching the AI service right now. Please retry in a moment.",
         confidence: 0
       };
     }
   }
 }
-
